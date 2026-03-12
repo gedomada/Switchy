@@ -2,7 +2,9 @@
 #include <wctype.h>
 #include <wchar.h>
 #include <stdlib.h>
+#if _DEBUG
 #include <stdio.h>
+#endif
 
 #define CLIPBOARD_DELAY_MS 50
 
