@@ -1,47 +1,38 @@
 #include <Windows.h>
+#include <wctype.h>
+#include <wchar.h>
+#include <stdlib.h>
 #if _DEBUG
 #include <stdio.h>
-#endif // _DEBUG
+#endif
 
-typedef NTSTATUS(WINAPI* RtlGetVersionPtr)(PRTL_OSVERSIONINFOW);
+#define CLIPBOARD_DELAY_MS 50
 
-typedef struct {
-	BOOL popup;
-} Settings;
+// Bidirectional transliteration mapping (QWERTY <-> JCUKEN)
+static const wchar_t MAP_LATIN[] =    L"qwertyuiop[]asdfghjkl;'zxcvbnm,.`QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>~";
+static const wchar_t MAP_CYRILLIC[] = L"\x0439\x0446\x0443\x043A\x0435\x043D\x0433\x0448\x0449\x0437\x0445\x044A\x0444\x044B\x0432\x0430\x043F\x0440\x043E\x043B\x0434\x0436\x044D\x044F\x0447\x0441\x043C\x0438\x0442\x044C\x0431\x044E\x0451\x0419\x0426\x0423\x041A\x0415\x041D\x0413\x0428\x0429\x0417\x0425\x042A\x0424\x042B\x0412\x0410\x041F\x0420\x041E\x041B\x0414\x0416\x042D\x042F\x0427\x0421\x041C\x0418\x0422\x042C\x0411\x042E\x0401";
+static const int MAP_LEN = sizeof(MAP_LATIN) / sizeof(wchar_t) - 1;
+
 
 void ShowError(LPCSTR message);
-DWORD GetOSVersion();
 void PressKey(int keyCode);
 void ReleaseKey(int keyCode);
 void ToggleCapsLockState();
+void SwitchLayout();
+wchar_t TransliterateChar(wchar_t ch);
+void TransliterateText(wchar_t* text);
+void ToggleCaseText(wchar_t* text);
+BOOL TryTransformSelectedText(void (*transformFn)(wchar_t*), BOOL shiftHeld);
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
 
 
 HHOOK hHook;
-BOOL enabled = TRUE;
 BOOL keystrokeCapsProcessed = FALSE;
 BOOL keystrokeShiftProcessed = FALSE;
-BOOL winPressed = FALSE;
-
-Settings settings = {
-	.popup = FALSE
-};
 
 
 int main(int argc, char** argv)
 {
-	if (argc > 1 && strcmp(argv[1], "nopopup") == 0)
-	{
-		settings.popup = FALSE;
-	}
-	else
-	{
-		settings.popup = GetOSVersion() >= 10;
-	}
-#if _DEBUG
-	printf("Pop-up is %s\n", settings.popup ? "enabled" : "disabled");
-#endif
-
 	HANDLE hMutex = CreateMutex(0, 0, "Switchy");
 	if (GetLastError() == ERROR_ALREADY_EXISTS)
 	{
@@ -64,7 +55,6 @@ int main(int argc, char** argv)
 	}
 
 	UnhookWindowsHookEx(hHook);
-
 	return 0;
 }
 
@@ -72,26 +62,6 @@ int main(int argc, char** argv)
 void ShowError(LPCSTR message)
 {
 	MessageBox(NULL, message, "Error", MB_OK | MB_ICONERROR);
-}
-
-
-DWORD GetOSVersion()
-{
-	HMODULE hMod = GetModuleHandleW(L"ntdll.dll");
-	RTL_OSVERSIONINFOW osvi = { 0 };
-
-	if (hMod)
-	{
-		RtlGetVersionPtr p = (RtlGetVersionPtr)GetProcAddress(hMod, "RtlGetVersion");
-
-		if (p)
-		{
-			osvi.dwOSVersionInfoSize = sizeof(osvi);
-			p(&osvi);
-		}
-	}
-
-	return osvi.dwMajorVersion;
 }
 
 
@@ -113,116 +83,253 @@ void ToggleCapsLockState()
 	ReleaseKey(VK_CAPITAL);
 #if _DEBUG
 	printf("Caps Lock state has been toggled\n");
-#endif // _DEBUG
+#endif
+}
+
+
+wchar_t TransliterateChar(wchar_t ch)
+{
+	for (int i = 0; i < MAP_LEN; i++)
+	{
+		if (MAP_LATIN[i] == ch) return MAP_CYRILLIC[i];
+		if (MAP_CYRILLIC[i] == ch) return MAP_LATIN[i];
+	}
+	return ch;
+}
+
+
+void TransliterateText(wchar_t* text)
+{
+	for (; *text; text++)
+		*text = TransliterateChar(*text);
+}
+
+
+void ToggleCaseText(wchar_t* text)
+{
+	for (; *text; text++)
+	{
+		wchar_t upper = *text, lower = *text;
+		CharUpperBuffW(&upper, 1);
+		CharLowerBuffW(&lower, 1);
+		if (*text == upper && *text != lower)
+			*text = lower;
+		else if (*text == lower && *text != upper)
+			*text = upper;
+	}
+}
+
+
+BOOL TryTransformSelectedText(void (*transformFn)(wchar_t*), BOOL shiftHeld)
+{
+	// Save current clipboard content
+	HGLOBAL savedClip = NULL;
+	if (OpenClipboard(NULL))
+	{
+		HANDLE hData = GetClipboardData(CF_UNICODETEXT);
+		if (hData)
+		{
+			wchar_t* src = (wchar_t*)GlobalLock(hData);
+			if (src)
+			{
+				size_t len = wcslen(src) + 1;
+				savedClip = GlobalAlloc(GMEM_MOVEABLE, len * sizeof(wchar_t));
+				if (savedClip)
+				{
+					wchar_t* dst = (wchar_t*)GlobalLock(savedClip);
+					if (dst)
+					{
+						memcpy(dst, src, len * sizeof(wchar_t));
+						GlobalUnlock(savedClip);
+					}
+				}
+				GlobalUnlock(hData);
+			}
+		}
+		EmptyClipboard();
+		CloseClipboard();
+	}
+
+	// Release Shift if held (avoid Ctrl+Shift+C)
+	if (shiftHeld)
+		ReleaseKey(VK_LSHIFT);
+
+	// Simulate Ctrl+C
+	PressKey(VK_CONTROL);
+	PressKey('C');
+	ReleaseKey('C');
+	ReleaseKey(VK_CONTROL);
+	Sleep(CLIPBOARD_DELAY_MS);
+
+	// Check if clipboard now has text (i.e., text was selected)
+	wchar_t* selectedText = NULL;
+	if (OpenClipboard(NULL))
+	{
+		HANDLE hData = GetClipboardData(CF_UNICODETEXT);
+		if (hData)
+		{
+			wchar_t* src = (wchar_t*)GlobalLock(hData);
+			if (src && wcslen(src) > 0)
+			{
+				size_t len = wcslen(src) + 1;
+				selectedText = (wchar_t*)malloc(len * sizeof(wchar_t));
+				if (selectedText)
+					memcpy(selectedText, src, len * sizeof(wchar_t));
+			}
+			if (src) GlobalUnlock(hData);
+		}
+		CloseClipboard();
+	}
+
+	if (!selectedText)
+	{
+		// No text was selected - restore clipboard and return FALSE
+		if (OpenClipboard(NULL))
+		{
+			EmptyClipboard();
+			if (savedClip)
+				SetClipboardData(CF_UNICODETEXT, savedClip);
+			CloseClipboard();
+		}
+		else if (savedClip)
+		{
+			GlobalFree(savedClip);
+		}
+		if (shiftHeld)
+			PressKey(VK_LSHIFT);
+		return FALSE;
+	}
+
+	// Transform the text
+	transformFn(selectedText);
+
+	// Put transformed text on clipboard
+	if (OpenClipboard(NULL))
+	{
+		EmptyClipboard();
+		size_t len = wcslen(selectedText) + 1;
+		HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, len * sizeof(wchar_t));
+		if (hMem)
+		{
+			wchar_t* dst = (wchar_t*)GlobalLock(hMem);
+			if (dst)
+			{
+				memcpy(dst, selectedText, len * sizeof(wchar_t));
+				GlobalUnlock(hMem);
+				SetClipboardData(CF_UNICODETEXT, hMem);
+			}
+		}
+		CloseClipboard();
+	}
+	free(selectedText);
+
+	// Simulate Ctrl+V
+	PressKey(VK_CONTROL);
+	PressKey('V');
+	ReleaseKey('V');
+	ReleaseKey(VK_CONTROL);
+	Sleep(CLIPBOARD_DELAY_MS);
+
+	// Restore original clipboard
+	if (OpenClipboard(NULL))
+	{
+		EmptyClipboard();
+		if (savedClip)
+			SetClipboardData(CF_UNICODETEXT, savedClip);
+		CloseClipboard();
+	}
+	else if (savedClip)
+	{
+		GlobalFree(savedClip);
+	}
+
+	// Re-press Shift if it was held
+	if (shiftHeld)
+		PressKey(VK_LSHIFT);
+
+#if _DEBUG
+	printf("Text has been transformed\n");
+#endif
+	return TRUE;
+}
+
+
+void SwitchLayout()
+{
+	HWND hwnd = GetForegroundWindow();
+	DWORD threadId = GetWindowThreadProcessId(hwnd, NULL);
+	HKL currentLayout = GetKeyboardLayout(threadId);
+
+	HKL layouts[16];
+	int count = GetKeyboardLayoutList(16, layouts);
+	if (count <= 1) return;
+
+	HKL nextLayout = layouts[0];
+	for (int i = 0; i < count; i++)
+	{
+		if (layouts[i] == currentLayout)
+		{
+			nextLayout = layouts[(i + 1) % count];
+			break;
+		}
+	}
+
+	PostMessage(hwnd, WM_INPUTLANGCHANGEREQUEST, 0, (LPARAM)nextLayout);
+#if _DEBUG
+	printf("Keyboard layout has been switched\n");
+#endif
 }
 
 
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
 	KBDLLHOOKSTRUCT* key = (KBDLLHOOKSTRUCT*)lParam;
+
 	if (nCode == HC_ACTION && !(key->flags & LLKHF_INJECTED))
 	{
 #if _DEBUG
 		const char* keyStatus = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) ? "pressed" : "released";
 		printf("Key %d has been %s\n", key->vkCode, keyStatus);
-#endif // _DEBUG
+#endif
+
 		if (key->vkCode == VK_CAPITAL)
 		{
-			if (wParam == WM_SYSKEYDOWN && !keystrokeCapsProcessed)
+			if ((wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) && !keystrokeCapsProcessed)
 			{
 				keystrokeCapsProcessed = TRUE;
-				enabled = !enabled;
-#if _DEBUG
-				printf("Switchy has been %s\n", enabled ? "enabled" : "disabled");
-#endif // _DEBUG
-				return 1;
+
+				if (keystrokeShiftProcessed)
+				{
+					if (!TryTransformSelectedText(ToggleCaseText, TRUE))
+						ToggleCapsLockState();
+				}
+				else
+				{
+					if (!TryTransformSelectedText(TransliterateText, FALSE))
+						SwitchLayout();
+				}
 			}
 
 			if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP)
 			{
 				keystrokeCapsProcessed = FALSE;
-
-				if (winPressed)
-				{
-					winPressed = FALSE;
-					ReleaseKey(VK_LWIN);
-				}
-
-				if (enabled && !settings.popup)
-				{
-					if (!keystrokeShiftProcessed)
-					{
-						PressKey(VK_MENU);
-						PressKey(VK_LSHIFT);
-						ReleaseKey(VK_MENU);
-						ReleaseKey(VK_LSHIFT);
-					}
-					else
-					{
-						keystrokeShiftProcessed = FALSE;
-					}
-				}
 			}
 
-			if (!enabled)
-			{
-				return CallNextHookEx(hHook, nCode, wParam, lParam);
-			}
-
-			if (wParam == WM_KEYDOWN && !keystrokeCapsProcessed)
-			{
-				keystrokeCapsProcessed = TRUE;
-
-				if (keystrokeShiftProcessed == TRUE)
-				{
-					ToggleCapsLockState();
-					return 1;
-				}
-				else
-				{
-					if (settings.popup)
-					{
-						PressKey(VK_LWIN);
-						PressKey(VK_SPACE);
-						ReleaseKey(VK_SPACE);
-						winPressed = TRUE;
-					}
-				}
-			}
 			return 1;
 		}
 
 		else if (key->vkCode == VK_LSHIFT)
 		{
+			if ((wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) && !keystrokeShiftProcessed)
+			{
+				keystrokeShiftProcessed = TRUE;
+			}
 
-			if ((wParam == WM_KEYUP || wParam == WM_SYSKEYUP) && !keystrokeCapsProcessed)
+			if ((wParam == WM_KEYUP || wParam == WM_SYSKEYUP))
 			{
 				keystrokeShiftProcessed = FALSE;
 			}
 
-			if (!enabled)
-			{
-				return CallNextHookEx(hHook, nCode, wParam, lParam);
-			}
-
-			if (wParam == WM_KEYDOWN && !keystrokeShiftProcessed)
-			{
-				keystrokeShiftProcessed = TRUE;
-
-				if (keystrokeCapsProcessed == TRUE)
-				{
-					ToggleCapsLockState();
-					if (settings.popup)
-					{
-						PressKey(VK_LWIN);
-						PressKey(VK_SPACE);
-						ReleaseKey(VK_SPACE);
-						winPressed = TRUE;
-					}
-
-					return 0;
-				}
-			}
 			return 0;
 		}
 	}
