@@ -250,6 +250,19 @@ BOOL TryTransformSelectedText(void (*transformFn)(wchar_t*), BOOL shiftHeld)
 		CloseClipboard();
 	}
 
+	// Detect IDE line-copy behavior: editors like VS Code copy the entire
+	// current line (ending with \r\n) when Ctrl+C is pressed with no selection.
+	// Treat this as "no selection" to avoid inserting transformed junk.
+	if (selectedText)
+	{
+		size_t len = wcslen(selectedText);
+		if (len > 0 && selectedText[len - 1] == L'\n')
+		{
+			free(selectedText);
+			selectedText = NULL;
+		}
+	}
+
 	if (!selectedText)
 	{
 		// No text was selected - restore clipboard and return FALSE
