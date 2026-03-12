@@ -2,11 +2,29 @@
 #include <wctype.h>
 #include <wchar.h>
 #include <stdlib.h>
-#if _DEBUG
 #include <stdio.h>
-#endif
 
 #define CLIPBOARD_DELAY_MS 50
+
+// Known terminal process names (lowercase for comparison)
+static const wchar_t* TERMINAL_PROCESSES[] = {
+	L"cmd.exe",
+	L"powershell.exe",
+	L"pwsh.exe",
+	L"windowsterminal.exe",
+	L"tabby.exe",
+	L"mintty.exe",
+	L"conemu.exe",
+	L"conemu64.exe",
+	L"conhost.exe",
+	L"alacritty.exe",
+	L"wezterm-gui.exe",
+	L"hyper.exe",
+	L"terminus.exe",
+	L"kitty.exe",
+	L"wt.exe",
+	NULL
+};
 
 // Bidirectional transliteration mapping (QWERTY <-> JCUKEN)
 static const wchar_t MAP_LATIN[] =    L"qwertyuiop[]asdfghjkl;'zxcvbnm,.`QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>~";
@@ -15,6 +33,7 @@ static const int MAP_LEN = sizeof(MAP_LATIN) / sizeof(wchar_t) - 1;
 
 
 void ShowError(LPCSTR message);
+BOOL IsTerminalWindow(HWND hwnd);
 void PressKey(int keyCode);
 void ReleaseKey(int keyCode);
 void ToggleCapsLockState();
@@ -62,6 +81,54 @@ int main(int argc, char** argv)
 void ShowError(LPCSTR message)
 {
 	MessageBox(NULL, message, "Error", MB_OK | MB_ICONERROR);
+}
+
+
+BOOL IsTerminalWindow(HWND hwnd)
+{
+	// Check window class for native console windows
+	char className[256];
+	if (GetClassNameA(hwnd, className, sizeof(className)))
+	{
+		if (strcmp(className, "ConsoleWindowClass") == 0 ||
+			strcmp(className, "CASCADIA_HOSTING_WINDOW_CLASS") == 0)
+			return TRUE;
+	}
+
+	// Check process name for third-party terminals (Tabby, Alacritty, etc.)
+	DWORD processId;
+	GetWindowThreadProcessId(hwnd, &processId);
+	HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+	if (!hProcess) return FALSE;
+
+	wchar_t exePath[MAX_PATH];
+	DWORD size = MAX_PATH;
+	BOOL result = FALSE;
+
+	if (QueryFullProcessImageNameW(hProcess, 0, exePath, &size))
+	{
+		wchar_t* filename = wcsrchr(exePath, L'\\');
+		filename = filename ? filename + 1 : exePath;
+
+		wchar_t lower[MAX_PATH];
+		for (int i = 0; filename[i] && i < MAX_PATH - 1; i++)
+		{
+			lower[i] = towlower(filename[i]);
+			lower[i + 1] = L'\0';
+		}
+
+		for (int i = 0; TERMINAL_PROCESSES[i]; i++)
+		{
+			if (wcscmp(lower, TERMINAL_PROCESSES[i]) == 0)
+			{
+				result = TRUE;
+				break;
+			}
+		}
+	}
+
+	CloseHandle(hProcess);
+	return result;
 }
 
 
@@ -297,15 +364,17 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
 			if ((wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) && !keystrokeCapsProcessed)
 			{
 				keystrokeCapsProcessed = TRUE;
+				HWND hwnd = GetForegroundWindow();
+				BOOL isTerminal = IsTerminalWindow(hwnd);
 
 				if (keystrokeShiftProcessed)
 				{
-					if (!TryTransformSelectedText(ToggleCaseText, TRUE))
+					if (isTerminal || !TryTransformSelectedText(ToggleCaseText, TRUE))
 						ToggleCapsLockState();
 				}
 				else
 				{
-					if (!TryTransformSelectedText(TransliterateText, FALSE))
+					if (isTerminal || !TryTransformSelectedText(TransliterateText, FALSE))
 						SwitchLayout();
 				}
 			}
